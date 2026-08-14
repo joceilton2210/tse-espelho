@@ -1,0 +1,107 @@
+name: Espelho TSE 2026
+
+# Baixa os arquivos oficiais do TSE e publica na release "dados".
+# O CDN do TSE bloqueia o IP da VPS (Contabo/EUA) com HTTP 403; os runners do
+# GitHub conseguem baixar normalmente e servem de intermediário.
+
+on:
+  schedule:
+    # A cada 3 horas (UTC). Ajuste se quiser mais/menos frequência.
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: espelho-tse
+  cancel-in-progress: false
+
+jobs:
+  espelhar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar arquivos do TSE
+        id: baixar
+        run: |
+          set -uo pipefail
+          mkdir -p dados
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
+          URLS=(
+            "https://cdn.tse.jus.br/estatistica/sead/odsele/consulta_cand/consulta_cand_2026.zip"
+            "https://cdn.tse.jus.br/estatistica/sead/eleicoes/eleicoes2026/fotos/foto_cand2026_MA_div.zip"
+            "https://cdn.tse.jus.br/estatistica/sead/eleicoes/eleicoes2026/fotos/foto_cand2026_BR_div.zip"
+          )
+
+          falhou=0
+          for url in "${URLS[@]}"; do
+            nome="$(basename "$url")"
+            echo "::group::$nome"
+            status=$(curl -sS -L --retry 3 --retry-delay 5 --max-time 300 \
+              -A "$UA" \
+              -H 'Accept-Language: pt-BR,pt;q=0.9' \
+              -H 'Referer: https://dadosabertos.tse.jus.br/' \
+              -o "dados/$nome" -w '%{http_code}' "$url") || status=000
+
+            tamanho=$(stat -c%s "dados/$nome" 2>/dev/null || echo 0)
+            echo "HTTP $status — $tamanho bytes"
+
+            if [ "$status" != "200" ] || [ "$tamanho" -lt 10000 ]; then
+              echo "::error::Falha ao baixar $nome (HTTP $status, $tamanho bytes)"
+              rm -f "dados/$nome"
+              falhou=1
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Um ZIP corrompido no espelho é pior que nenhum arquivo.
+            if ! unzip -tq "dados/$nome"; then
+              echo "::error::$nome não é um ZIP válido"
+              rm -f "dados/$nome"
+              falhou=1
+            fi
+            echo "::endgroup::"
+          done
+
+          if [ -z "$(ls -A dados 2>/dev/null)" ]; then
+            echo "::error::Nenhum arquivo baixado — abortando sem alterar a release."
+            exit 1
+          fi
+
+          {
+            echo "gerado_em=$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "falhou=$falhou"
+          } >> "$GITHUB_OUTPUT"
+
+          ls -lh dados
+
+      - name: Publicar na release "dados"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GERADO_EM: ${{ steps.baixar.outputs.gerado_em }}
+        run: |
+          set -euo pipefail
+          gh release view dados --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create dados \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Espelho dos dados do TSE" \
+              --notes "Arquivos oficiais do TSE espelhados automaticamente."
+
+          gh release upload dados dados/* \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+          {
+            echo "Espelho automático dos arquivos oficiais do TSE."
+            echo ""
+            echo "Última atualização: $GERADO_EM"
+            echo "Fonte: https://dadosabertos.tse.jus.br/dataset/candidatos-2026"
+          } > notas.md
+
+          gh release edit dados --repo "$GITHUB_REPOSITORY" --notes-file notas.md
+
+      - name: Sinalizar downloads que falharam
+        if: steps.baixar.outputs.falhou == '1'
+        run: |
+          echo "Alguns arquivos não foram atualizados nesta execução. Veja os erros acima."
+          exit 1
