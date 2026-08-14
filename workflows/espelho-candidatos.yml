@@ -1,0 +1,65 @@
+name: Espelho TSE - candidatos
+
+# Espelha o ZIP nacional de candidaturas (contém todos os estados).
+# ~2,6 MB. O CDN do TSE responde 403 para o IP da VPS; os runners do GitHub
+# conseguem baixar e servem de intermediário.
+
+on:
+  schedule:
+    - cron: '17 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: espelho-tse-candidatos
+  cancel-in-progress: false
+
+jobs:
+  espelhar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar do TSE
+        run: |
+          set -uo pipefail
+          mkdir -p dados
+          source_url="https://cdn.tse.jus.br/estatistica/sead/odsele/consulta_cand/consulta_cand_2026.zip"
+          nome="consulta_cand_2026.zip"
+
+          status=$(curl -sS -L --retry 3 --retry-delay 5 --max-time 300 \
+            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36' \
+            -H 'Accept-Language: pt-BR,pt;q=0.9' \
+            -H 'Referer: https://dadosabertos.tse.jus.br/' \
+            -o "dados/$nome" -w '%{http_code}' "$source_url") || status=000
+
+          tamanho=$(stat -c%s "dados/$nome" 2>/dev/null || echo 0)
+          echo "HTTP $status — $tamanho bytes"
+
+          if [ "$status" != "200" ] || [ "$tamanho" -lt 100000 ]; then
+            echo "::error::Falha ao baixar $nome (HTTP $status, $tamanho bytes)"
+            exit 1
+          fi
+
+          if ! unzip -tq "dados/$nome"; then
+            echo "::error::$nome não é um ZIP válido"
+            exit 1
+          fi
+
+          ls -lh dados
+
+      - name: Publicar na release "dados"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view dados --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create dados \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Espelho dos dados do TSE" \
+              --notes "Espelho automático dos arquivos oficiais do TSE."
+
+          gh release upload dados dados/consulta_cand_2026.zip \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+          echo "Candidaturas atualizadas em $(date -u '+%Y-%m-%d %H:%M UTC')" >> "$GITHUB_STEP_SUMMARY"

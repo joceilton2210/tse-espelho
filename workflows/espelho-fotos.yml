@@ -1,0 +1,120 @@
+name: Espelho TSE - fotos
+
+# Espelha os ZIPs de fotos dos candidatos de TODAS as 27 UFs + BR (presidente).
+# ~100 MB no total. Fotos mudam pouco, então roda uma vez por dia.
+
+on:
+  schedule:
+    - cron: '40 7 * * *'   # 04:40 em Brasília
+  workflow_dispatch:
+    inputs:
+      ufs:
+        description: 'UFs a espelhar (separadas por espaço). Vazio = todas.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: espelho-tse-fotos
+  cancel-in-progress: false
+
+jobs:
+  espelhar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Baixar fotos do TSE
+        id: baixar
+        env:
+          UFS_ENTRADA: ${{ github.event.inputs.ufs }}
+        run: |
+          set -uo pipefail
+          mkdir -p dados
+
+          TODAS="AC AL AP AM BA CE DF ES GO MA MT MS MG PA PB PR PE PI RJ RN RS RO RR SC SP SE TO BR"
+          UFS="${UFS_ENTRADA:-}"
+          [ -z "$UFS" ] && UFS="$TODAS"
+
+          UA='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+          BASE='https://cdn.tse.jus.br/estatistica/sead/eleicoes/eleicoes2026/fotos'
+
+          ok=0
+          falhas=""
+
+          for uf in $UFS; do
+            nome="foto_cand2026_${uf}_div.zip"
+            status=$(curl -sS -L --retry 3 --retry-delay 5 --max-time 300 \
+              -A "$UA" \
+              -H 'Accept-Language: pt-BR,pt;q=0.9' \
+              -H 'Referer: https://dadosabertos.tse.jus.br/' \
+              -o "dados/$nome" -w '%{http_code}' "$BASE/$nome") || status=000
+
+            tamanho=$(stat -c%s "dados/$nome" 2>/dev/null || echo 0)
+
+            if [ "$status" != "200" ] || [ "$tamanho" -lt 50000 ]; then
+              echo "  $uf  FALHOU (HTTP $status, $tamanho bytes)"
+              rm -f "dados/$nome"
+              falhas="$falhas $uf"
+              continue
+            fi
+
+            # ZIP corrompido no espelho é pior que arquivo ausente.
+            if ! unzip -tq "dados/$nome"; then
+              echo "  $uf  ZIP INVÁLIDO"
+              rm -f "dados/$nome"
+              falhas="$falhas $uf"
+              continue
+            fi
+
+            printf '  %-3s OK  %s\n' "$uf" "$(numfmt --to=iec "$tamanho")"
+            ok=$((ok + 1))
+            sleep 1
+          done
+
+          echo "----"
+          echo "Baixados: $ok"
+          [ -n "$falhas" ] && echo "Falhas:$falhas"
+
+          if [ "$ok" -eq 0 ]; then
+            echo "::error::Nenhuma foto baixada — abortando sem alterar a release."
+            exit 1
+          fi
+
+          {
+            echo "ok=$ok"
+            echo "falhas=$falhas"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publicar na release "dados"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view dados --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create dados \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Espelho dos dados do TSE" \
+              --notes "Espelho automático dos arquivos oficiais do TSE."
+
+          # Sobe em lotes para não estourar o tempo de uma única chamada.
+          for arquivo in dados/*.zip; do
+            gh release upload dados "$arquivo" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
+      - name: Resumo
+        run: |
+          {
+            echo "### Espelho de fotos"
+            echo ""
+            echo "- Arquivos atualizados: ${{ steps.baixar.outputs.ok }}"
+            echo "- Falhas:${{ steps.baixar.outputs.falhas }} (vazio = nenhuma)"
+            echo "- Executado em: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Falhar se alguma UF não veio
+        if: steps.baixar.outputs.falhas != ''
+        run: |
+          echo "UFs que falharam:${{ steps.baixar.outputs.falhas }}"
+          exit 1
